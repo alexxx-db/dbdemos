@@ -1,4 +1,5 @@
 import json
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.catalog import VolumeType
@@ -15,6 +16,9 @@ if TYPE_CHECKING:
 
 class InstallerGenie:
     VOLUME_NAME = "dbdemos_raw_data"
+    RESERVED_TAG_KEY_MAP = {
+        "system.Certified": "system_Certified",
+    }
 
     def __init__(self, installer: 'Installer'):
         self.installer = installer
@@ -168,14 +172,44 @@ class InstallerGenie:
     def run_sql_queries(self, ws: WorkspaceClient, demo_conf: DemoConf, warehouse_id, debug=True):
         for batch in demo_conf.sql_queries:
             with ThreadPoolExecutor(max_workers=5) as ex:
-                futures = [ex.submit(self.sql_query_executor.execute_query, ws, q, warehouse_id=warehouse_id, debug=debug) for q in batch]
+                sanitized_queries = []
+                for q in batch:
+                    sanitized_query = self.sanitize_reserved_tag_keys_in_sql(q)
+                    if debug and sanitized_query != q:
+                        print(f"Warn - replacing reserved tag key in SQL query: {q} -> {sanitized_query}")
+                    sanitized_queries.append(sanitized_query)
+                futures = [ex.submit(self.sql_query_executor.execute_query, ws, q, warehouse_id=warehouse_id, debug=debug) for q in sanitized_queries]
                 for f in as_completed(futures):
                     try:
                         f.result()
                     except SQLQueryException as e:
-                        if "tag name" in str(e).lower():
+                        if self.is_ignorable_tag_error(e):
                             print(f"Warn - SQL error on tag ignored - probably free edition: {e}")
-                        else: raise
+                        else:
+                            raise
+
+    @classmethod
+    def sanitize_reserved_tag_keys_in_sql(cls, query: str) -> str:
+        if not query:
+            return query
+        sanitized_query = query
+        for reserved_key, safe_key in cls.RESERVED_TAG_KEY_MAP.items():
+            sanitized_query = re.sub(
+                re.escape(reserved_key),
+                safe_key,
+                sanitized_query,
+                flags=re.IGNORECASE,
+            )
+        return sanitized_query
+
+    @staticmethod
+    def is_ignorable_tag_error(exception: Exception) -> bool:
+        error = str(exception).lower()
+        return (
+            "tag name" in error
+            or "tag key" in error
+            or "system.certified" in error
+        )
 
     def get_current_cluster_id(self):
         return json.loads(self.installer.get_dbutils_tags_safe()['clusterId'])
