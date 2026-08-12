@@ -1,3 +1,5 @@
 recursive-include dbdemos/bundles *
 recursive-include dbdemos/template *
 recursive-include dbdemos/resources *
+prune dbdemos/minisite
+global-exclude __pycache__ *.py[cod]

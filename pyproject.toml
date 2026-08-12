@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dbdemos"
+version = "0.6.34"
+description = "Install databricks demos: notebooks, Delta Live Table Pipeline, DBSQL Dashboards, ML Models etc."
+readme = "README.md"
+requires-python = ">=3.7"
+license = { text = "Databricks License" }
+authors = [
+  { name = "Databricks", email = "quentin.ambard@databricks.com" },
+  { name = "Databricks", email = "cal.reynolds@databricks.com" }
+]
+dependencies = [
+  "requests==2.33.0",
+  "pandas==3.0.1",
+  "databricks-sdk==0.114.0",
+  "cryptography==46.0.6"
+]
+
+[project.urls]
+Homepage = "https://github.com/databricks-demos/dbdemos"
+
+[tool.setuptools]
+include-package-data = true
+license-files = ["LICENSE"]
+
+[tool.setuptools.packages.find]
+exclude = ["tests", "tests.*"]
+
+[tool.setuptools.package-data]
+dbdemos = [
+  "bundles/**/*",
+  "resources/**/*",
+  "template/**/*"
+]
