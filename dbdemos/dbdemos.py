@@ -258,6 +258,9 @@ def install(demo_name, path = None, overwrite = False, username = None, pat_toke
     elif demo_name == "auto-loader":
         print("WARN: auto-loader has been renamed to data-ingestion")
         demo_name = "data-ingestion"
+    elif demo_name == "ai-bi-marketing-campaign":
+        print("WARN: ai-bi-marketing-campaign has been renamed to aibi-marketing-campaign")
+        demo_name = "aibi-marketing-campaign"
 
         
         

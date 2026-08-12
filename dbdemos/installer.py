@@ -305,7 +305,7 @@ class Installer:
         if demo_conf.custom_schema_supported:
             self.create_or_check_schema(demo_conf, create_schema, debug)
 
-        if demo_name.startswith("aibi"):
+        if self.is_ai_bi_demo(demo_name):
             use_current_cluster = True
         if serverless:
             use_current_cluster = True
@@ -338,6 +338,10 @@ class Installer:
                 self.db.post(f"2.0/pipelines/{pipeline['uid']}/updates", { "full_refresh": True })
 
         self.report.display_install_result(demo_name, demo_conf.description, demo_conf.title, install_path, notebooks, init_job['uid'], init_job['run_id'], serverless, cluster_id, cluster_name, pipeline_ids, dashboards, workflows, genie_rooms)
+
+    @staticmethod
+    def is_ai_bi_demo(demo_name: str) -> bool:
+        return demo_name.startswith(("aibi", "ai-bi"))
 
 
     def get_demo_datasource(self, warehouse_name = None):
