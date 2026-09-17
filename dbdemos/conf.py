@@ -237,12 +237,16 @@ class DemoConf():
         self.catalog = catalog
         self.default_schema = json_conf.get('default_schema', "")
         self.default_catalog = json_conf.get('default_catalog', "")
+        # Catalog used during bundling (isolated from the real default_catalog). Notebooks use
+        # `main__build` (or `main_build` for demos registering UC functions, which reject `__`).
+        # The packager rewrites both back to the default_catalog when packaging for end users.
+        self.build_catalog = json_conf.get('build_catalog', (self.default_catalog + "__build") if self.default_catalog else "")
         self.custom_message = json_conf.get('custom_message', "")
         self.create_cluster = json_conf.get('create_cluster', True)
         self.dashboards = json_conf.get('dashboards', [])
         self.sql_queries = json_conf.get('sql_queries', [])
         self.bundle = json_conf.get('bundle', False)
-        self.env_version = json_conf.get('env_version', 2)
+        self.env_version = json_conf.get('env_version', 5)
         
         self.data_folders: List[DataFolder] = []
         for data_folder in json_conf.get('data_folders', []):
