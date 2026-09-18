@@ -12,7 +12,8 @@ from .installer_genie import InstallerGenie
 from .installer_dashboard import InstallerDashboard
 from .tracker import Tracker
 from .notebook_parser import NotebookParser
-from .installer_workflows import InstallerWorkflow
+from .installer_workflows import InstallerWorkflow, get_resource
+from .installer_pipelines import PipelineInstaller
 from .installer_repos import InstallerRepo
 from pathlib import Path
 import time
@@ -25,6 +26,7 @@ import urllib
 import threading
 from dbdemos.sql_query import SQLQueryExecutor
 from databricks.sdk import WorkspaceClient
+
 
 class Installer:
     def __init__(self, username = None, pat_token = None, workspace_url = None, cloud = None, org_id: str = None, current_cluster_id: str = None, github_token: str = None):
@@ -46,7 +48,8 @@ class Installer:
         self.tracker = Tracker(org_id, self.get_uid(), username)
         self.db = DBClient(conf)
         self.report = InstallerReport(self.db.conf.workspace_url)
-        self.installer_workflow = InstallerWorkflow(self)
+        self.installer_workflow = InstallerWorkflow(self.db, self.report, self.get_or_create_endpoint)
+        self.installer_pipelines = PipelineInstaller(self.db, self.report)
         self.installer_repo = InstallerRepo(self)
         self.installer_dashboard = InstallerDashboard(self)
         self.installer_genie = InstallerGenie(self)
@@ -218,8 +221,7 @@ class Installer:
         return DemoConf(demo_name, json.loads(conf_template.replace_template_key(demo)), catalog, schema)
 
     def get_resource(self, path, decode=True):
-        resource = pkg_resources.resource_string("dbdemos", path)
-        return resource.decode('UTF-8') if decode else resource
+        return get_resource(path, decode)
     
     def resource_isdir(self, path):
         return pkg_resources.resource_isdir("dbdemos", path)
@@ -496,76 +498,7 @@ class Installer:
             return [n for n in executor.map(load_notebook, demo_conf.notebooks)]
 
     def load_demo_pipelines(self, demo_name, demo_conf: DemoConf, debug=False, serverless=False, dlt_policy_id = None, dlt_compute_settings = None):
-        #default cluster conf
-        pipeline_ids = []
-        for pipeline in demo_conf.pipelines:
-            definition = pipeline["definition"]
-            if "event_log" not in definition:
-                definition["event_log"] = {"catalog": demo_conf.catalog, "schema": demo_conf.schema, "name": "dlt_event_log_"}
-            if "target" in definition:
-                definition["schema"] = definition["target"]
-                del definition["target"] #target is deprecated now (https://docs.databricks.com/api/workspace/pipelines/create#schema)
-            #Force channel to current due to issue with PREVIEW on serverless with python verison
-            definition["channel"] = "CURRENT"
-            today = date.today().strftime("%Y-%m-%d")
-            #modify cluster definitions if serverless
-            if serverless:
-                if "clusters" in definition:
-                    del definition['clusters']
-                definition['photon'] = True
-                definition['serverless'] = True
-                if dlt_policy_id is not None:
-                    self.report.display_pipeline_error(SDPCreationException(f"Policy ID is not supported for serverless pipelines, {dlt_policy_id}", definition, None))
-            else:
-                #enforce demo tagging in the cluster
-                for cluster in definition["clusters"]:
-                    merge_dict(cluster, {"custom_tags": {"project": "dbdemos", "demo": demo_name, "demo_install_date": today}})
-                    if dlt_policy_id is not None:
-                        cluster["dlt_policy_id"] = dlt_policy_id
-                    if self.db.conf.get_demo_pool() is not None:
-                        cluster["instance_pool_id"] = self.db.conf.get_demo_pool()
-                        if "node_type_id" in cluster: del cluster["node_type_id"]
-                        if "enable_elastic_disk" in cluster: del cluster["enable_elastic_disk"]
-                        if "aws_attributes" in cluster: del cluster["aws_attributes"]
-                    if dlt_compute_settings is not None:
-                        merge_dict(cluster, dlt_compute_settings)
-
-            existing_pipeline = self.get_pipeline(definition["name"])
-            if debug:
-                print(f'    Installing pipeline {definition["name"]}')
-            if existing_pipeline == None:
-                p = self.db.post("2.0/pipelines", definition)
-                if 'error_code' in p and p['error_code'] == 'FEATURE_DISABLED':
-                    message = f'SDP pipelines are not available in this workspace. Only Premium workspaces are supported on Azure.'
-                    pipeline_ids.append({"name": pipeline["definition"]["name"], "uid": "INSTALLATION_ERROR", "id": pipeline["id"], "error": True})
-                    self.report.display_pipeline_error(SDPNotAvailableException(message, definition, p))
-                    continue
-                if 'error_code' in p:
-                    pipeline_ids.append({"name": pipeline["definition"]["name"], "uid": "INSTALLATION_ERROR", "id": pipeline["id"], "error": True})
-                    self.report.display_pipeline_error(SDPCreationException(f"Error creating the SDP pipeline: {p['error_code']}", definition, p))
-                    continue
-                id = p['pipeline_id']
-            else:
-                if debug:
-                    print("    Updating existing pipeline with last configuration")
-                id = existing_pipeline['pipeline_id']
-                p = self.db.put("2.0/pipelines/"+id, definition)
-                if 'error_code' in p:
-                    pipeline_ids.append({"name": pipeline["definition"]["name"], "uid": "INSTALLATION_ERROR", "id": pipeline["id"], "error": True})
-                    if 'complete the migration' in str(p).lower() or 'CANNOT_SET_SCHEMA_FOR_EXISTING_PIPELINE' in str(p):
-                        self.report.display_pipeline_error_migration(SDPCreationException(f"Please delete the existing SDP pipeline id {id} before re-installing this demo.", definition, p))
-                    else:
-                        self.report.display_pipeline_error(SDPCreationException(f"Error updating the SDP pipeline {id}: {p['error_code']}", definition, p))
-                    continue
-            permissions = self.db.patch(f"2.0/preview/permissions/pipelines/{id}", {
-                "access_control_list": [{"group_name": "users", "permission_level": "CAN_MANAGE"}]
-            })
-            if 'error_code' in permissions:
-                print(f"WARN: Couldn't update the pipeline permission for all users to access: {permissions}. Try deleting the pipeline first?")
-            pipeline_ids.append({"name": definition['name'], "uid": id, "id": pipeline["id"], "run_after_creation": pipeline["run_after_creation"]})
-            #Update the demo conf tags {{}} with the actual id (to be loaded as a job for example)
-            demo_conf.set_pipeline_id(pipeline["id"], id)
-        return pipeline_ids
+        return self.installer_pipelines.load_demo_pipelines(demo_name, demo_conf, debug, serverless, dlt_policy_id, dlt_compute_settings)
 
     def load_demo_cluster(self, demo_name, demo_conf: DemoConf, update_cluster_if_exists, start_cluster = None, use_cluster_id = None):
         if use_cluster_id is not None:
@@ -661,16 +594,7 @@ class Installer:
         return None
 
     def get_pipeline(self, name):
-        def get_pipelines(token = None):
-            r = self.db.get("2.0/pipelines", {"max_results": 100, "page_token": token})
-            if "statuses" in r:
-                for p in r["statuses"]:
-                    if p["name"] == name:
-                        return p
-            if "next_page_token" in r:
-                return get_pipelines(r["next_page_token"])
-            return None
-        return get_pipelines()
+        return self.installer_pipelines.get_pipeline(name)
 
 
     def add_cluster_setup_cell(self, parser: NotebookParser, demo_name, cluster_name, cluster_id, env_url):

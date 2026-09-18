@@ -226,8 +226,15 @@ class InstallerGenie:
                     print(f"Loading data {data_folder}: {sql_query}")
                 self.sql_query_executor.execute_query(ws, sql_query, warehouse_id=warehouse_id, debug=debug)
             except Exception as e:
-                if "com.amazonaws.auth.BasicSessionCredentials" in str(e):
-                    print("INFO: Basic Credential error detected downloading the files from our demo bucket. Will try to load data to volume first, please wait as this is a slower workflow...")
+                err = str(e)
+                # The direct read_files('s3://...') needs cloud credentials AND, on UC, the
+                # privilege to read arbitrary files (SELECT ON ANY FILE / an external location).
+                # On workspaces that lack either (e.g. locked-down demo/event workspaces), fall
+                # back to copying the parquet into a volume first and reading from there.
+                if ("com.amazonaws.auth.BasicSessionCredentials" in err
+                        or "INSUFFICIENT_PERMISSIONS" in err
+                        or "SELECT on any file" in err):
+                    print("INFO: Can't read directly from our demo bucket (cloud credentials or file privileges missing). Falling back to loading data via a volume first, please wait as this is a slower workflow...")
                     self.create_raw_data_volume(ws, conf, debug)
                     self.load_data_to_volume(ws, data_folder, conf, debug)
                     self.create_table_from_volume(ws, data_folder, warehouse_id, conf, debug)

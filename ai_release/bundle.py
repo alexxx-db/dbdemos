@@ -74,6 +74,11 @@ def load_config(args):
     notebooks_path = os.environ.get("DBDEMOS_NOTEBOOKS_PATH", config.get("dbdemos_notebooks_path", default_notebooks_path))
     config["dbdemos_notebooks_path"] = notebooks_path
 
+    # Environment variables override the config file
+    for key, env_var in [("url", "DATABRICKS_HOST"), ("pat_token", "DATABRICKS_TOKEN"), ("github_token", "GITHUB_TOKEN")]:
+        if os.environ.get(env_var):
+            config[key] = os.environ[env_var]
+
     # Branch override from CLI
     if args.branch:
         config["branch"] = args.branch
