@@ -324,7 +324,7 @@ class NotebookParser:
 
     #Set the environment metadata to the notebook.
     # TODO: might want to re-evaluate this once we move to ipynb format as it'll be set in the ipynb file, as metadata.
-    def set_environement_metadata(self, client_version: str = "3"):
+    def set_environement_metadata(self, client_version: str = "5"):
         content = json.loads(self.content)
         env_metadata = content.get("environmentMetadata", {})
         if env_metadata is None:

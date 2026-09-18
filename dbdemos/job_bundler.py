@@ -1,4 +1,7 @@
 from .conf import DBClient, DemoConf, Conf, ConfTemplate, merge_dict
+from .installer_report import InstallerReport
+from .installer_workflows import InstallerWorkflow
+from .installer_pipelines import PipelineInstaller
 import time
 import json
 import re
@@ -8,12 +11,20 @@ import collections
 import requests
 
 class JobBundler:
+    # Job parameter holding the repo commit a bundle init_job run was executed from.
+    COMMIT_PARAMETER = "dbdemos_commit"
+
     def __init__(self, conf: Conf):
         self.bundles = {}
         self.staging_reseted = False
         self.head_commit_id = None
         self.conf = conf
         self.db = DBClient(conf)
+        self.report = InstallerReport(self.db.conf.workspace_url)
+        self.installer_pipelines = PipelineInstaller(self.db, self.report)
+        # No endpoint provider in the bundler context: demos whose init_job needs a
+        # SQL warehouse ({{SHARED_WAREHOUSE_ID}}) will raise a clear error.
+        self.installer_workflow = InstallerWorkflow(self.db, self.report, get_endpoint_fn=None)
 
     def get_cluster_conf(self, demo_conf: DemoConf):
         conf_template = ConfTemplate(self.conf.username, demo_conf.name)
@@ -174,12 +185,7 @@ class JobBundler:
                                     print(f"skipping job execution {demo_conf.name} as it was already run and skip_execution=True.")
                                 else:
                                     #last run was using the same commit version.
-                                    most_recent_commit = ''
-                                    for task in run['tasks']:
-                                        # Safely get the commit if git_source and git_snapshot exist
-                                        task_commit = task.get('git_source', {}).get('git_snapshot', {}).get('used_commit', '')
-                                        if task_commit > most_recent_commit:
-                                            most_recent_commit = task_commit
+                                    most_recent_commit = self.get_run_commit(run)
                                     if not self.check_if_demo_file_changed_since_commit(demo_conf, most_recent_commit, head_commit) and most_recent_commit != '':
                                         execute = False
                                         demo_conf.run_id = run['run_id']
@@ -187,9 +193,26 @@ class JobBundler:
                                     
                     if execute:
                         run = self.db.post("2.1/jobs/run-now", {"job_id": demo_conf.job_id})
+                        if "run_id" not in run:
+                            raise Exception(f"Could not start job {demo_conf.job_id} for demo {demo_conf.name}: {run}")
                         demo_conf.run_id = run["run_id"]
 
             collections.deque(executor.map(run_job, [c[1] for c in self.bundles.items()]))
+
+    def get_run_commit(self, run: dict) -> str:
+        """Commit a bundle run was executed from: git_snapshot for git-sourced jobs,
+        the dbdemos_commit job parameter for init_jobs (WORKSPACE source). '' if unknown."""
+        most_recent_commit = ''
+        for task in run.get('tasks', []):
+            # Safely get the commit if git_source and git_snapshot exist
+            task_commit = task.get('git_source', {}).get('git_snapshot', {}).get('used_commit', '')
+            if task_commit > most_recent_commit:
+                most_recent_commit = task_commit
+        if most_recent_commit == '':
+            for param in run.get('job_parameters', []):
+                if param.get('name') == self.COMMIT_PARAMETER:
+                    most_recent_commit = param.get('value') or param.get('default', '')
+        return most_recent_commit
 
     def wait_for_bundle_jobs_completion(self):
         for _, demo_conf in self.bundles.items():
@@ -206,7 +229,16 @@ class JobBundler:
                 i += 1
                 time.sleep(5)
 
+    def has_init_job(self, demo_conf: DemoConf) -> bool:
+        return isinstance(demo_conf.init_job, dict) and "settings" in demo_conf.init_job
+
     def create_bundle_job(self, demo_conf: DemoConf, recreate_jobs: bool = False):
+        # Demos with an init_job are bundled by running that init_job (it creates the
+        # SDP pipeline, loads data into the volume, and runs the notebooks in the right
+        # dependency order). This avoids the pre_run notebook job racing ahead of the
+        # pipeline (schema not found). Demos without an init_job keep the legacy path.
+        if self.has_init_job(demo_conf):
+            return self.create_init_bundle_job(demo_conf, recreate_jobs)
         notebooks_to_run = demo_conf.get_notebooks_to_run()
         if len(notebooks_to_run) == 0:
             return None
@@ -217,38 +249,44 @@ class JobBundler:
             default_job_conf["git_source"]["git_url"] = self.conf.repo_url
             default_job_conf["git_source"]["git_branch"] = self.conf.branch
 
-            cluster_conf = self.get_cluster_conf(demo_conf)
-            #Update the job cluster with the specific demo setup if any
-            for job_cluster in default_job_conf["job_clusters"]:
-                merge_dict(job_cluster["new_cluster"], cluster_conf)
-                job_cluster["new_cluster"]["single_user_name"] = self.conf.run_test_as_username
-                # Custom instance (ex: gpu), not i3, remove the pool
-                # expected format: {"AWS": "g5.4xlarge", "AZURE": "Standard_NC8as_T4_v3", "GCP": "a2-highgpu-1g"}
-                if "node_type_id" in job_cluster["new_cluster"] and "AWS" in job_cluster["new_cluster"]["node_type_id"]:
-                    job_cluster["new_cluster"].pop('instance_pool_id', None)
-                    job_cluster["new_cluster"]["node_type_id"] = job_cluster["new_cluster"]["node_type_id"]["AWS"]
-                    job_cluster["new_cluster"]["driver_node_type_id"] = job_cluster["new_cluster"]["driver_node_type_id"]["AWS"]
-                elif self.db.conf.get_demo_pool() is not None:
-                    job_cluster["new_cluster"]["instance_pool_id"] = self.db.conf.get_demo_pool()
-                    job_cluster["new_cluster"].pop("node_type_id", None)
-                    job_cluster["new_cluster"].pop("enable_elastic_disk", None)
-                    job_cluster["new_cluster"].pop("aws_attributes", None)
-                elif 'instance_pool_id' in job_cluster["new_cluster"]:
-                    job_cluster["new_cluster"].pop('node_type_id', None)
-                    job_cluster["new_cluster"].pop("enable_elastic_disk", None)
-                    job_cluster["new_cluster"].pop("aws_attributes", None)
+            # Bundle jobs run on serverless (see default_test_job_conf.json 'environments').
+            # The classic job_cluster merge below only applies if a job template still
+            # declares job_clusters (kept for backward compatibility / classic overrides).
+            if default_job_conf.get("job_clusters"):
+                cluster_conf = self.get_cluster_conf(demo_conf)
+                #Update the job cluster with the specific demo setup if any
+                for job_cluster in default_job_conf["job_clusters"]:
+                    merge_dict(job_cluster["new_cluster"], cluster_conf)
+                    job_cluster["new_cluster"]["single_user_name"] = self.conf.run_test_as_username
+                    # Custom instance (ex: gpu), not i3, remove the pool
+                    # expected format: {"AWS": "g5.4xlarge", "AZURE": "Standard_NC8as_T4_v3", "GCP": "a2-highgpu-1g"}
+                    if "node_type_id" in job_cluster["new_cluster"] and "AWS" in job_cluster["new_cluster"]["node_type_id"]:
+                        job_cluster["new_cluster"].pop('instance_pool_id', None)
+                        job_cluster["new_cluster"]["node_type_id"] = job_cluster["new_cluster"]["node_type_id"]["AWS"]
+                        job_cluster["new_cluster"]["driver_node_type_id"] = job_cluster["new_cluster"]["driver_node_type_id"]["AWS"]
+                    elif self.db.conf.get_demo_pool() is not None:
+                        job_cluster["new_cluster"]["instance_pool_id"] = self.db.conf.get_demo_pool()
+                        job_cluster["new_cluster"].pop("node_type_id", None)
+                        job_cluster["new_cluster"].pop("enable_elastic_disk", None)
+                        job_cluster["new_cluster"].pop("aws_attributes", None)
+                    elif 'instance_pool_id' in job_cluster["new_cluster"]:
+                        job_cluster["new_cluster"].pop('node_type_id', None)
+                        job_cluster["new_cluster"].pop("enable_elastic_disk", None)
+                        job_cluster["new_cluster"].pop("aws_attributes", None)
 
-                job_cluster["new_cluster"].pop('cluster_name', None)
-                job_cluster["new_cluster"].pop('autotermination_minutes', None)
-                if job_cluster["new_cluster"]["spark_conf"].get("spark.databricks.cluster.profile", "") == "singleNode":
-                    del job_cluster["new_cluster"]["autoscale"]
-                    job_cluster["new_cluster"]["num_workers"] = 0
+                    job_cluster["new_cluster"].pop('cluster_name', None)
+                    job_cluster["new_cluster"].pop('autotermination_minutes', None)
+                    if job_cluster["new_cluster"]["spark_conf"].get("spark.databricks.cluster.profile", "") == "singleNode":
+                        del job_cluster["new_cluster"]["autoscale"]
+                        job_cluster["new_cluster"]["num_workers"] = 0
             default_job_conf['tasks'] = []
 
             # Added for unit testing 01/13/2025. Enforcing single user to reduce
             #  complexity of testing.
             default_job_conf["run_as"] = {"user_name": self.conf.run_test_as_username}
 
+            # Serverless jobs attach compute via environment_key; classic jobs via job_cluster_key.
+            serverless = bool(default_job_conf.get("environments"))
             for i, notebook in enumerate(notebooks_to_run):
                 task = {
                     "task_key": f"bundle_{demo_conf.name}_{i}",
@@ -258,12 +296,16 @@ class JobBundler:
                         "source": "GIT"
                     },
                     "libraries": notebook.libraries,
-                    "job_cluster_key": default_job_conf["job_clusters"][0]["job_cluster_key"],
                     "timeout_seconds": 0,
                     "email_notifications": {}}
+                if serverless:
+                    task["environment_key"] = default_job_conf["environments"][0]["environment_key"]
+                else:
+                    task["job_cluster_key"] = default_job_conf["job_clusters"][0]["job_cluster_key"]
                 merge_dict(task["notebook_task"]["base_parameters"], notebook.parameters)
                 if notebook.warehouse_id:
-                    del task["job_cluster_key"]
+                    task.pop("environment_key", None)
+                    task.pop("job_cluster_key", None)
                     task["notebook_task"]["warehouse_id"] = notebook.warehouse_id
                 if notebook.depends_on_previous:
                     task["depends_on"] = [{"task_key": f"bundle_{demo_conf.name}_{i-1}"}]
@@ -272,6 +314,52 @@ class JobBundler:
                 del default_job_conf['tasks'][0]["depends_on"]
 
             return self.create_or_update_job(demo_conf, default_job_conf, recreate_jobs)
+
+    def create_init_bundle_job(self, demo_conf: DemoConf, recreate_jobs: bool = False):
+        """Bundle a demo by (re)creating & running its init_job.
+
+        The init_job runs: load-data (into the volume) -> SDP pipeline -> notebooks,
+        in dependency order, so notebooks that read pipeline tables no longer race
+        the pipeline. Notebooks that are pre_run but not in the init_job are expected
+        to be added to the init_job as `"bundle_only": true` tasks (stripped at install).
+
+        The demo's init_job / pipeline templates ({{CATALOG}}, {{SCHEMA}},
+        {{DEMO_FOLDER}}, {{CURRENT_USER_NAME}}...) are resolved here for the build
+        (catalog = default_catalog, schema = default_schema, demo folder = the repo
+        path). {{DYNAMIC_SDP_ID_*}} is resolved by load_demo_pipelines when the
+        pipeline is created.
+        """
+        # Resolve the build catalog/schema on the demo_conf so pipeline + init_job
+        # templates point at the isolated BUILD catalog (main__build / main_build),
+        # not the real default_catalog (main). Notebooks use the same build catalog;
+        # the packager rewrites it back to default_catalog for end users.
+        demo_conf.catalog = demo_conf.build_catalog
+        demo_conf.schema = demo_conf.default_schema
+        # init_job notebook tasks use "source": "WORKSPACE", so {{DEMO_FOLDER}} must be the
+        # absolute workspace path of the demo inside the staging repo (Jobs API requires an
+        # absolute path starting with "/"), not the repo-relative demo_conf.path.
+        demo_folder = f"{self.conf.get_repo_path()}/{demo_conf.path.lstrip('/')}"
+        conf_template = ConfTemplate(self.conf.username, demo_conf.name,
+                                     catalog=demo_conf.catalog, schema=demo_conf.schema,
+                                     demo_folder=demo_folder)
+        demo_conf.init_job = json.loads(conf_template.replace_template_key(json.dumps(demo_conf.init_job)))
+        for pipeline in demo_conf.pipelines:
+            pipeline["definition"] = json.loads(conf_template.replace_template_key(json.dumps(pipeline["definition"])))
+
+        # Create the SDP pipeline(s) first; this resolves {{DYNAMIC_SDP_ID_*}} in init_job.
+        self.installer_pipelines.load_demo_pipelines(demo_conf.name, demo_conf, serverless=True)
+
+        # init_job tasks run from WORKSPACE source, so runs carry no git_snapshot.used_commit.
+        # Record the staging repo commit as a job parameter instead: job parameters are captured
+        # on each run, which lets run_bundle_jobs skip demos unchanged since their last success.
+        if self.head_commit_id:
+            parameters = [p for p in demo_conf.init_job["settings"].get("parameters", []) if p["name"] != self.COMMIT_PARAMETER]
+            parameters.append({"name": self.COMMIT_PARAMETER, "default": self.head_commit_id})
+            demo_conf.init_job["settings"]["parameters"] = parameters
+
+        # Create (or reset) the init job with bundle_only tasks kept.
+        init_job = self.installer_workflow.create_demo_init_job(demo_conf, serverless=True, is_bundle=True)
+        return init_job["uid"]
 
     def create_or_update_job(self, demo_conf: DemoConf, job_conf: dict, recreate_jobs: bool = False):
         print(f'searching for job {job_conf["name"]}')
